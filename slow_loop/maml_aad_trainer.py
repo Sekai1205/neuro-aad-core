@@ -4,6 +4,7 @@ import torch.optim as optim
 import scipy.io as sio
 import numpy as np
 import os
+import higher  # 🔮 これがMAMLの魔法のライブラリ
 from models.eeg_1d_cnn import EEG1DCNN
 
 device = torch.device('mps' if torch.backends.mps.is_available() else 'cpu')
@@ -36,75 +37,67 @@ def load_ku_leuven_data(file_path):
     return X_tensor, y_tensor
 
 def main():
-    print(f"=== Starting Training with Validation on {device} ===")
+    print(f"=== Starting MAML (Meta-Learning) on {device} ===")
     
     file_path = "data/KULeuven data set/S1.mat"
     X_data, y_data = load_ku_leuven_data(file_path)
     
+    # データをランダムにシャッフル
     dataset_size = len(X_data)
-    print(f"✅ 全データ数: {dataset_size} 個")
+    indices = torch.randperm(dataset_size)
+    X_data = X_data[indices]
+    y_data = y_data[indices]
 
-    # ---------------------------------------------------------
-    # 🆕 データを「学習用(80%)」と「テスト用(20%)」にシャッフルして分割
-    # ---------------------------------------------------------
-    train_size = int(0.8 * dataset_size)
-    indices = torch.randperm(dataset_size) # データをランダムにシャッフル
-    
-    train_indices = indices[:train_size]
-    val_indices = indices[train_size:]
-    
-    X_train, y_train = X_data[train_indices], y_data[train_indices]
-    X_val, y_val = X_data[val_indices], y_data[val_indices]
-    
-    print(f"📚 学習用(過去問): {len(X_train)} 個")
-    print(f"📝 テスト用(初見): {len(X_val)} 個\n")
-
+    # モデルとメタ最適化ツール（「適応力」を鍛える大元の先生）
     model = EEG1DCNN(num_channels=64, num_classes=2).to(device)
-    optimizer = optim.Adam(model.parameters(), lr=0.001)
+    meta_optimizer = optim.Adam(model.parameters(), lr=0.001)
     loss_fn = nn.CrossEntropyLoss()
 
-    batch_size = 32
+    # --- MAMLの心臓部（ハイパーパラメータ） ---
+    inner_lr = 0.01  # 個人適応（キャリブレーション）時の学習率
+    inner_steps = 3  # たった3回のステップで適応させる（3分間の初期設定を模擬）
     epochs = 15
+    task_batch_size = 32 # 1回の「タスク」に使うデータの数
+
+    print("🚀 MAMLループを起動します...「適応のしかた」を学習中...")
 
     for epoch in range(1, epochs + 1):
-        # --- 📚 学習フェーズ（過去問を解いて賢くなる） ---
-        model.train() # 学習モードON
-        train_loss = 0.0
+        meta_loss = 0.0
         
-        for i in range(0, len(X_train), batch_size):
-            batch_X = X_train[i:i+batch_size].to(device)
-            batch_y = y_train[i:i+batch_size].to(device)
+        for i in range(0, dataset_size - task_batch_size, task_batch_size):
+            # MAMLでは、データを「Support(練習用)」と「Query(本番テスト用)」に分けます
+            half = task_batch_size // 2
+            x_spt, y_spt = X_data[i : i+half].to(device), y_data[i : i+half].to(device)
+            x_qry, y_qry = X_data[i+half : i+task_batch_size].to(device), y_data[i+half : i+task_batch_size].to(device)
 
-            optimizer.zero_grad()
-            predictions = model(batch_X)
-            loss = loss_fn(predictions, batch_y)
-            loss.backward()
-            optimizer.step()
-            train_loss += loss.item()
+            meta_optimizer.zero_grad()
+
+            # --- 🔮 higherライブラリによるMAMLの魔法 ---
+            # innerloop_ctx が、AIの脳の「一時的なクローン(fmodel)」を作ってシミュレーションさせます
+            with higher.innerloop_ctx(model, optim.SGD(model.parameters(), lr=inner_lr), copy_initial_weights=False) as (fmodel, diffopt):
+                
+                # 【内側のループ（Inner Loop）】
+                # Supportデータ（数分間のキャリブレーション）を使って、クローンを「今の被験者」に素早く適応させる
+                for step in range(inner_steps):
+                    spt_preds = fmodel(x_spt)
+                    spt_loss = loss_fn(spt_preds, y_spt)
+                    diffopt.step(spt_loss)
+                
+                # 【外側のループ（Outer Loop）】
+                # 適応したクローンが、未知のQueryデータ（本番）でどれくらい通用するかをテストする
+                qry_preds = fmodel(x_qry)
+                qry_loss = loss_fn(qry_preds, y_qry)
+                
+                # そのテストの誤差から「どうすればもっと上手く適応できるベースモデルになれるか」を計算！
+                qry_loss.backward()
             
-        avg_train_loss = train_loss / (len(X_train) / batch_size)
-
-        # --- 📝 テストフェーズ（初見のデータで実力を測る） ---
-        model.eval() # 学習モードOFF（ズル禁止）
-        correct = 0
-        total = len(X_val)
-        
-        # テスト中は脳のネットワークを更新しない
-        with torch.no_grad():
-            val_X = X_val.to(device)
-            val_y = y_val.to(device)
-            val_preds = model(val_X)
+            # 大元のメタモデルを更新（適応能力がアップする）
+            meta_optimizer.step()
+            meta_loss += qry_loss.item()
             
-            # AIが「左(0)」「右(1)」どちらの確率が高いと判断したかを取得
-            _, predicted_labels = torch.max(val_preds, 1)
-            correct = (predicted_labels == val_y).sum().item()
-            
-        val_accuracy = (correct / total) * 100 # 正解率(%)
+        print(f"Epoch {epoch:2d}/{epochs} | Meta-Loss (適応能力の誤差): {meta_loss:.4f}")
 
-        # 結果の表示
-        print(f"Epoch {epoch:2d}/{epochs} | 学習Loss: {avg_train_loss:.4f} | テスト正解率: {val_accuracy:.1f}%")
-
-    print("\n🎉 検証ループ完了！")
+    print("\n🎉 MAMLのコアシステムが完成しました！")
 
 if __name__ == '__main__':
     main()
