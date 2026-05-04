@@ -33,19 +33,24 @@ This project is managed via `uv` for ultra-fast Python environment resolution.
 uv venv
 source .venv/bin/activate
 uv pip install torch torchvision torchaudio scipy matplotlib numpy higher
+```
 
-2. Run MAML Evaluation
+###2. Run MAML Evaluation
 Ensure the KU Leuven dataset (S1.mat) is placed in data/KULeuven data set/.
+```bash
 uv run slow_loop/maml_aad_trainer.py
+```
 
-3. Run C++ Fast Loop (Lock-free Test)
+###3. Run C++ Fast Loop (Lock-free Test)
+```bash
 clang++ -std=c++17 fast_loop/src/main_audio.cpp -o fast_loop_test
 ./fast_loop_test
+```
 
-🔬 Future Roadmap
+##🔬 Future Roadmap
 • [x] Phase 0: Baseline CNN vs MAML Evaluation (Achieved >80% accuracy)
 • [ ] Phase 1: Integration of MAML and C++ Fast Loop via IPC (Inter-Process Communication)
 • [ ] Phase 2: PAMR (Postauricular Muscle Reflex) pilot study for alternative triggering
 Developed by Sekai1205. Engineered for real-time human augmentation.
 
-```bash
+
