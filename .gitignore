@@ -3,3 +3,11 @@
 __pycache__/
 data/*
 !data/.gitkeep
+
+*.mat
+*.wav
+dataset/
+results/
+*.png
+*.txt
+*.csv
