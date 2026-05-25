@@ -18,6 +18,7 @@ import pandas as pd
 import matplotlib.pyplot as plt
 from sklearn.metrics import confusion_matrix
 import warnings
+import gc
 
 PROJECT_ROOT = Path(__file__).parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
@@ -272,6 +273,10 @@ class AADmTRFExperiment:
             
             correct = "✓" if trial_acc >= 0.5 else "✗"
             print(f"  Trial {test_idx+1:02d}/20: 10s acc={trial_acc:.2%} {correct}, 30s acc={trial_acc_30s:.2%}")
+            
+            # Explicit memory cleanup of the model instance
+            del aad
+            gc.collect()
         
         # Convert to numpy
         all_window_predictions = np.array(all_window_predictions)
@@ -299,7 +304,7 @@ class AADmTRFExperiment:
         print(f"    Track2: {fn} false negatives, {tp} correct")
         print(f"{'='*70}")
         
-        return {
+        res_dict = {
             'subject_id': subject_id,
             'window_predictions': all_window_predictions,
             'window_ground_truth': all_window_ground_truth,
@@ -312,6 +317,12 @@ class AADmTRFExperiment:
             'n_trials': 20,
             'window_size': window_size
         }
+        
+        # Explicit memory cleanup of the loaded trials data
+        del trials_data
+        gc.collect()
+        
+        return res_dict
     
     def save_results(self, results: dict):
         """
@@ -427,22 +438,86 @@ class AADmTRFExperiment:
         Run complete experiment.
         """
         subjects = [1] if self.quick_mode else list(range(1, 17))
+        
+        csv_path = self.results_dir.parent / "aad_mtrf" / "all_subjects_summary.csv"
+        csv_path.parent.mkdir(parents=True, exist_ok=True)
+        
+        completed_subjects = set()
+        if csv_path.exists():
+            try:
+                df_existing = pd.read_csv(csv_path)
+                if 'Subject' in df_existing.columns:
+                     completed_subjects = set(df_existing['Subject'].tolist())
+                     print(f"Found existing summary CSV. Completed subjects: {completed_subjects}")
+            except Exception as e:
+                print(f"Could not read existing summary CSV: {e}. Will overwrite or create new.")
+        
         all_results = []
         
+        # Load already computed results from existing CSV
+        if csv_path.exists() and not self.quick_mode:
+            try:
+                df_existing = pd.read_csv(csv_path)
+                for _, row in df_existing.iterrows():
+                    sub_name = row['Subject']
+                    sub_id = int(sub_name.replace('S', ''))
+                    all_results.append({
+                        'subject_id': sub_id,
+                        'accuracy': row['Accuracy'],
+                        'n_windows': int(row['TotalWindows']),
+                        'correct_windows': int(row['CorrectWindows'])
+                    })
+                print(f"Loaded {len(all_results)} existing subjects from {csv_path}")
+            except Exception as e:
+                print(f"Error rebuilding all_results from existing CSV: {e}")
+        
         for subject_id in subjects:
+            sub_name = f"S{subject_id}"
+            if sub_name in completed_subjects:
+                print(f"\n>>> Subject {sub_name} already completed. Skipping...")
+                continue
+                
             results = self.run_subject_loocv(subject_id)
             if results is not None:
-                all_results.append(results)
                 self.save_results(results)
+                
+                # Progressive saving to CSV
+                correct_windows = int(results['n_windows'] * results['accuracy'])
+                single_summary = pd.DataFrame([{
+                    'Subject': f"S{results['subject_id']}",
+                    'Accuracy': results['accuracy'],
+                    'CorrectWindows': correct_windows,
+                    'TotalWindows': results['n_windows']
+                }])
+                
+                # Append to CSV
+                header = not csv_path.exists() or csv_path.stat().st_size == 0
+                single_summary.to_csv(csv_path, mode='a', index=False, header=header)
+                print(f"Saved progressive summary for S{results['subject_id']} to {csv_path}")
+                
+                # Update memory list (replace placeholder if it exists)
+                all_results = [r for r in all_results if r['subject_id'] != results['subject_id']]
+                all_results.append({
+                    'subject_id': results['subject_id'],
+                    'accuracy': results['accuracy'],
+                    'n_windows': results['n_windows'],
+                    'correct_windows': correct_windows
+                })
+                
+            # Loop memory cleanup
+            if 'results' in locals():
+                del results
+            gc.collect()
         
         # Summary
+        all_results = sorted(all_results, key=lambda x: x['subject_id'])
         print(f"\n=== AAD Classification: All Subjects ===")
         
         if all_results:
             accuracies = [res['accuracy'] for res in all_results]
             
             for res in all_results:
-                correct = int(res['n_windows']*res['accuracy'])
+                correct = res.get('correct_windows', int(res['n_windows']*res['accuracy']))
                 total = res['n_windows']
                 print(f"S{res['subject_id']}:  Accuracy = {res['accuracy']:.4f} ({correct}/{total} windows)")
             
@@ -453,21 +528,6 @@ class AADmTRFExperiment:
             else:
                 print(f"\nGroup Mean: {accuracies[0]:.4f} ± 0.0000")
             print("Chance level: 0.50")
-            
-            # Save summary to CSV
-            import pandas as pd
-            summary_data = []
-            for res in all_results:
-                summary_data.append({
-                    'Subject': f"S{res['subject_id']}",
-                    'Accuracy': res['accuracy'],
-                    'CorrectWindows': int(res['n_windows']*res['accuracy']),
-                    'TotalWindows': res['n_windows']
-                })
-            df = pd.DataFrame(summary_data)
-            csv_path = self.results_dir.parent / "aad_mtrf" / "all_subjects_summary.csv"
-            csv_path.parent.mkdir(parents=True, exist_ok=True)
-            df.to_csv(csv_path, index=False)
 
 
 def main():
