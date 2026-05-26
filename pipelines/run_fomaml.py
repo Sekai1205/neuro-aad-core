@@ -51,34 +51,26 @@ WINDOW_SIZE = 1000  # 10 seconds @ 100 Hz
 
 def load_subject_specific_accuracies(csv_path: Path) -> dict:
     """
-    Dynamically loads baseline accuracies from all_subjects_summary.csv,
-    parsing floating ratios (e.g. 0.6017) or percent strings (e.g. 60.18%).
+    Loads the 4ch auditory baseline accuracies (CONFIG_AUDIO at 10s window)
+    from 4ch_comparison.csv to serve as the proper 4ch upper bound comparison.
     """
     accuracies = {}
     if not csv_path.exists():
-        print(f"Warning: Baseline summary CSV not found at {csv_path}. Using hardcoded fallback values.")
-        return {'S1': 60.18, 'S5': 77.88, 'S10': 69.91, 'S14': 80.31}
+        print(f"Warning: 4ch comparison CSV not found at {csv_path}. Using 4ch fallback defaults.")
+        return {'S1': 56.19, 'S5': 63.94, 'S10': 61.28, 'S14': 65.93}
     
     try:
         df = pd.read_csv(csv_path)
-        for _, row in df.iterrows():
-            sub = str(row['Subject']).strip()
-            acc_val = row['Accuracy']
-            if isinstance(acc_val, str):
-                acc_val = acc_val.replace('%', '').strip()
-                acc = float(acc_val)
-            else:
-                acc = float(acc_val)
-            
-            # Convert ratio to percentage if necessary
-            if acc <= 1.0:
-                acc *= 100
-            
+        # Filter for CONFIG_AUDIO and 10s window size
+        df_filt = df[(df['config'] == 'CONFIG_AUDIO') & (df['window_s'] == 10)]
+        for _, row in df_filt.iterrows():
+            sub = str(row['subject']).strip()
+            acc = float(row['accuracy_pct'])
             accuracies[sub] = acc
-        print(f"Successfully loaded {len(accuracies)} subject-specific accuracies dynamically from {csv_path}")
+        print(f"Successfully loaded {len(accuracies)} 4ch baseline accuracies dynamically from {csv_path}")
     except Exception as e:
-        print(f"Error loading subject-specific accuracies: {e}. Using fallback values.")
-        return {'S1': 60.18, 'S5': 77.88, 'S10': 69.91, 'S14': 80.31}
+        print(f"Error loading 4ch accuracies: {e}. Using fallback defaults.")
+        return {'S1': 56.19, 'S5': 63.94, 'S10': 61.28, 'S14': 65.93}
         
     return accuracies
 
@@ -101,8 +93,8 @@ def main():
     # Initialize experiment class (shares the envelope cache)
     experiment = AADmTRFExperiment(quick_mode=False)
 
-    # Load dynamic baseline accuracies
-    baseline_csv = PROJECT_ROOT / "results" / "aad_mtrf" / "all_subjects_summary.csv"
+    # Load dynamic baseline accuracies (Proper 4ch CONFIG_AUDIO 10s baseline)
+    baseline_csv = PROJECT_ROOT / "results" / "4ch_comparison.csv"
     baseline_accuracies = load_subject_specific_accuracies(baseline_csv)
 
     # Load all subjects data
@@ -374,11 +366,41 @@ def main():
             adapted_acc = np.mean(np.array(adapted_preds) == np.array(adapted_gts)) if n_windows_rem > 0 else 0.5
             print(f"FOMAML Adapted ({calib_s}s calib) Accuracy: {adapted_acc:.2%}")
             
+            # C. Evaluate Direct Ridge calibration on N-second calibration data
+            # Use AADmTRF (matches the exact Ridge logic of Crosse 2016 toolbox)
+            direct_ridge = AADmTRF(fs=FS, tmin=TMIN, tmax=TMAX, lambda_=LAMBDA)
+            
+            # Fit expects a list of trials, so we wrap calib_eeg/calib_env
+            # Pre-apply bandpass filter is already done during loading
+            direct_ridge.fit([calib_eeg], [calib_env])
+            
+            direct_preds = []
+            for w in range(n_windows_rem):
+                start = w * WINDOW_SIZE
+                end = (w + 1) * WINDOW_SIZE
+                win_eeg = rem_eeg[start:end]
+                win_env1 = rem_env1[start:end]
+                win_env2 = rem_env2[start:end]
+                
+                # classify_attention does window-level Pearson correlation comparisons
+                pred, r1, r2 = direct_ridge.classify_attention(win_eeg, win_env1, win_env2)
+                direct_preds.append(pred)
+                
+            direct_acc = np.mean(np.array(direct_preds) == np.array(adapted_gts)) if n_windows_rem > 0 else 0.5
+            print(f"Direct Ridge Calib ({calib_s}s calib) Accuracy: {direct_acc:.2%}")
+            
             subject_results.append({
                 'subject': f"S{test_sub_id}",
                 'model': 'FOMAML_adapted',
                 'calib_s': calib_s,
                 'accuracy_pct': adapted_acc * 100
+            })
+            
+            subject_results.append({
+                'subject': f"S{test_sub_id}",
+                'model': 'direct_ridge_calib',
+                'calib_s': calib_s,
+                'accuracy_pct': direct_acc * 100
             })
             
             # Record generic and subject specific for this subject x calib_s combination
@@ -422,6 +444,9 @@ def main():
     generate_figures(df_full, figures_dir, baseline_accuracies)
     print("FOMAML Learning Curve figure successfully generated!")
 
+    # Generate Comparison Report
+    generate_report(df_full, results_dir)
+
 def generate_figures(df, figures_dir, baseline_accuracies=None):
     """Generate learning curve figure for FOMAML comparison."""
     # Compute group level summary
@@ -431,20 +456,23 @@ def generate_figures(df, figures_dir, baseline_accuracies=None):
 
     plt.figure(figsize=(10, 6))
     
-    models = ['FOMAML_adapted', 'generic_torch', 'subject_specific_mtrf']
+    models = ['FOMAML_adapted', 'generic_torch', 'direct_ridge_calib', 'subject_specific_mtrf']
     colors = {
         'FOMAML_adapted': '#E76F51',
         'generic_torch': '#264653',
+        'direct_ridge_calib': '#E9C46A',
         'subject_specific_mtrf': '#2A9D8F'
     }
     markers = {
         'FOMAML_adapted': 'o',
         'generic_torch': 's',
+        'direct_ridge_calib': 'D',
         'subject_specific_mtrf': '^'
     }
     labels = {
         'FOMAML_adapted': 'FOMAML (Meta-Init + Adaptation)',
         'generic_torch': 'Generic PyTorch Decoder (No Adaptation)',
+        'direct_ridge_calib': 'Direct Ridge Calibration (No Meta-Init)',
         'subject_specific_mtrf': 'Subject-Specific Decoder (Upper Bound)'
     }
 
@@ -471,6 +499,74 @@ def generate_figures(df, figures_dir, baseline_accuracies=None):
     plt.tight_layout()
     plt.savefig(figures_dir / "fomaml_learning_curve.png", dpi=150)
     plt.close()
+
+def generate_report(df: pd.DataFrame, results_dir: Path):
+    """
+    Generate a formatted pivot report matching the professor's expectations:
+    Columns: Subject | 4ch上限(mTRF) | generic_torch | direct_ridge_120s | FOMAML_120s | Delta(FOMAML vs direct)
+    """
+    print("\n" + "=" * 80)
+    print("GENERATING LEADERBOARD REPORT FOR PROFESSOR")
+    print("=" * 80)
+    
+    # Filter only relevant calibration time (120s) for reporting
+    df_120 = df[df['calib_s'] == 120]
+    
+    if df_120.empty:
+        print("Warning: No 120s calibration data available to generate report.")
+        return
+        
+    # Pivot wide
+    pivot_df = df_120.pivot(index='subject', columns='model', values='accuracy_pct').reset_index()
+    
+    # Ensure all required columns exist, fallback to NaN if missing
+    for col in ['subject_specific_mtrf', 'generic_torch', 'direct_ridge_calib', 'FOMAML_adapted']:
+        if col not in pivot_df.columns:
+            pivot_df[col] = np.nan
+            
+    # Rename columns to match professor's expectation
+    report_df = pd.DataFrame({
+        '被験者': pivot_df['subject'],
+        '4ch上限(mTRF)': pivot_df['subject_specific_mtrf'],
+        'generic_torch': pivot_df['generic_torch'],
+        'direct_ridge_120s': pivot_df['direct_ridge_calib'],
+        'FOMAML_120s': pivot_df['FOMAML_adapted']
+    })
+    
+    # Calculate Delta (FOMAML vs direct)
+    report_df['Delta(FOMAML vs direct)'] = report_df['FOMAML_120s'] - report_df['direct_ridge_120s']
+    
+    # Calculate Mean and Std
+    numeric_cols = ['4ch上限(mTRF)', 'generic_torch', 'direct_ridge_120s', 'FOMAML_120s', 'Delta(FOMAML vs direct)']
+    
+    mean_row = {'被験者': '平均 (Mean)'}
+    std_row = {'被験者': '標準偏差 (Std)'}
+    
+    for col in numeric_cols:
+        mean_row[col] = report_df[col].mean()
+        std_row[col] = report_df[col].std()
+        
+    # Append Mean and Std rows
+    report_df = pd.concat([report_df, pd.DataFrame([mean_row, std_row])], ignore_index=True)
+    
+    # Save comparison report to CSV
+    report_csv = results_dir / "fomaml_comparison_report.csv"
+    report_df.to_csv(report_csv, index=False)
+    print(f"Comparison report saved to {report_csv}")
+    
+    # Print formatted markdown table
+    print("\n--- Formatted Leaderboard Table ---")
+    
+    # Helper to print floats nicely with % sign
+    fmt_df = report_df.copy()
+    for col in numeric_cols:
+        fmt_df[col] = fmt_df[col].apply(lambda v: f"{v:.2f}%" if pd.notna(v) else "N/A")
+    # delta column show sign
+    fmt_df['Delta(FOMAML vs direct)'] = report_df['Delta(FOMAML vs direct)'].apply(
+        lambda v: f"+{v:.2f}%" if pd.notna(v) and v > 0 else (f"{v:.2f}%" if pd.notna(v) else "N/A")
+    )
+    print(fmt_df.to_string(index=False))
+    print("=" * 80 + "\n")
 
 if __name__ == "__main__":
     main()
