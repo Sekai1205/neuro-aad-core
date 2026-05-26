@@ -31,7 +31,7 @@ np.random.seed(42)
 torch.manual_seed(42)
 
 # Quick mode config
-QUICK_MODE = True  # Set to True for S1-only 10 epochs test, False for full 16-subj LOOCV
+QUICK_MODE = False  # Set to True for S1-only 10 epochs test, False for full 16-subj LOOCV
 
 # 4-Channel Electrode Configuration
 AUDIO_4CH_INDICES = [15, 52, 37, 47]  # TP7, TP8, Fz, Cz
