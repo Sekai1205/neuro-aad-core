@@ -16,6 +16,7 @@ from scipy import signal, stats
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import gc
 
 # Project root setup
 PROJECT_ROOT = Path(__file__).parent.parent
@@ -28,6 +29,12 @@ from mtrf.aad_mtrf import AADmTRF
 # Set random seeds
 np.random.seed(42)
 torch.manual_seed(42)
+
+# Quick mode config
+QUICK_MODE = True  # Set to True for S1-only 10 epochs test, False for full 16-subj LOOCV
+
+# 4-Channel Electrode Configuration
+AUDIO_4CH_INDICES = [15, 52, 37, 47]  # TP7, TP8, Fz, Cz
 
 # Constants
 TMIN = 0.0
@@ -42,13 +49,38 @@ META_EPOCHS = 500
 CALIB_TIMES = [10, 30, 60, 120]  # seconds
 WINDOW_SIZE = 1000  # 10 seconds @ 100 Hz
 
-# Hardcoded subject-specific upper bound accuracies (from results/aad_mtrf/all_subjects_summary.csv)
-SUBJECT_SPECIFIC_ACCURACIES = {
-    'S1': 60.18,
-    'S5': 77.88,
-    'S10': 69.91,
-    'S14': 80.31
-}
+def load_subject_specific_accuracies(csv_path: Path) -> dict:
+    """
+    Dynamically loads baseline accuracies from all_subjects_summary.csv,
+    parsing floating ratios (e.g. 0.6017) or percent strings (e.g. 60.18%).
+    """
+    accuracies = {}
+    if not csv_path.exists():
+        print(f"Warning: Baseline summary CSV not found at {csv_path}. Using hardcoded fallback values.")
+        return {'S1': 60.18, 'S5': 77.88, 'S10': 69.91, 'S14': 80.31}
+    
+    try:
+        df = pd.read_csv(csv_path)
+        for _, row in df.iterrows():
+            sub = str(row['Subject']).strip()
+            acc_val = row['Accuracy']
+            if isinstance(acc_val, str):
+                acc_val = acc_val.replace('%', '').strip()
+                acc = float(acc_val)
+            else:
+                acc = float(acc_val)
+            
+            # Convert ratio to percentage if necessary
+            if acc <= 1.0:
+                acc *= 100
+            
+            accuracies[sub] = acc
+        print(f"Successfully loaded {len(accuracies)} subject-specific accuracies dynamically from {csv_path}")
+    except Exception as e:
+        print(f"Error loading subject-specific accuracies: {e}. Using fallback values.")
+        return {'S1': 60.18, 'S5': 77.88, 'S10': 69.91, 'S14': 80.31}
+        
+    return accuracies
 
 def bandpass_filter(data, fs=100, low=1.0, high=8.0, order=3):
     """1-8 Hz bandpass filter matching the baseline pipeline."""
@@ -69,14 +101,20 @@ def main():
     # Initialize experiment class (shares the envelope cache)
     experiment = AADmTRFExperiment(quick_mode=False)
 
+    # Load dynamic baseline accuracies
+    baseline_csv = PROJECT_ROOT / "results" / "aad_mtrf" / "all_subjects_summary.csv"
+    baseline_accuracies = load_subject_specific_accuracies(baseline_csv)
+
     # Load all subjects data
     subjects_data = {}
     for subject_id in range(1, 17):
-        print(f"Loading and pre-filtering Subject S{subject_id} data...")
+        print(f"Loading and pre-filtering Subject S{subject_id} data (4ch constraint)...")
         subject_trials = []
         for trial_idx in range(20):
             trial_data = experiment.load_trial_data_with_envelopes(subject_id, trial_idx)
             if trial_data is not None:
+                # Pre-apply 4-channel constraint
+                trial_data['eeg'] = trial_data['eeg'][:, AUDIO_4CH_INDICES]
                 # Pre-apply bandpass filter to save time during training
                 trial_data['eeg'] = bandpass_filter(trial_data['eeg'])
                 trial_data['envelope_track1'] = bandpass_filter(trial_data['envelope_track1'])
@@ -84,17 +122,44 @@ def main():
                 subject_trials.append(trial_data)
         subjects_data[subject_id] = subject_trials
 
-    # We evaluate 4 LOOCV folds: held-out subjects S1, S5, S10, S14
-    test_subject_ids = [1, 5, 10, 14]
-    n_features = 64 * 26  # 64 channels * 26 lags
+    # Set features for 4-channel configuration
+    n_features = len(AUDIO_4CH_INDICES) * 26  # 4 channels * 26 lags = 104
+
+    # Setup QUICK_MODE or full LOOCV
+    if QUICK_MODE:
+        test_subject_ids = [1]
+        meta_epochs_run = 10
+        print(f"QUICK_MODE is ACTIVE: Running S1 only with {meta_epochs_run} meta-epochs.")
+    else:
+        test_subject_ids = list(range(1, 17))
+        meta_epochs_run = META_EPOCHS  # 500
+        print(f"Running full benchmark: Testing all 16 subjects with {meta_epochs_run} meta-epochs.")
+
+    # Check for existing progressive results (Checkpoint recovery)
+    completed_folds = set()
+    csv_path = results_dir / "fomaml_results.csv"
+    if csv_path.exists():
+        try:
+            df_existing = pd.read_csv(csv_path)
+            if 'subject' in df_existing.columns:
+                completed_folds = set(df_existing['subject'].tolist())
+                print(f"Found existing FOMAML results. Completed subjects: {completed_folds}")
+        except Exception as e:
+            print(f"Could not read existing FOMAML results: {e}")
 
     results = []
 
     for test_sub_id in test_subject_ids:
+        sub_name = f"S{test_sub_id}"
+        if sub_name in completed_folds:
+            print(f"\n>>> Subject {sub_name} already completed. Skipping...")
+            continue
+            
         print(f"\n==================================================")
         print(f"LOOCV Fold: Test Subject S{test_sub_id}")
         print(f"==================================================")
         
+        subject_results = []
         train_subjects = [s for s in range(1, 17) if s != test_sub_id]
         
         # 1. FOMAML Meta-Training
@@ -102,7 +167,7 @@ def main():
         meta_model = LinearmTRF(n_features=n_features)
         outer_opt = torch.optim.Adam(meta_model.parameters(), lr=OUTER_LR)
         
-        for epoch in range(1, META_EPOCHS + 1):
+        for epoch in range(1, meta_epochs_run + 1):
             # Sample a training subject (task)
             task_sub_id = np.random.choice(train_subjects)
             task_trials = subjects_data[task_sub_id]
@@ -180,8 +245,9 @@ def main():
                     param.grad = adapted_grads[name]
             outer_opt.step()
             
-            if epoch % 50 == 0:
-                print(f"  Epoch {epoch:3d}/{META_EPOCHS}: Query Loss = {query_loss.item():.6f}")
+            log_interval = max(1, meta_epochs_run // 10)
+            if epoch % log_interval == 0 or epoch == meta_epochs_run:
+                print(f"  Epoch {epoch:3d}/{meta_epochs_run}: Query Loss = {query_loss.item():.6f}")
                 
         # Save meta-initialized model checkpoint
         ckpt_path = results_dir / f"fomaml_meta_init_S{test_sub_id}.pt"
@@ -308,7 +374,7 @@ def main():
             adapted_acc = np.mean(np.array(adapted_preds) == np.array(adapted_gts)) if n_windows_rem > 0 else 0.5
             print(f"FOMAML Adapted ({calib_s}s calib) Accuracy: {adapted_acc:.2%}")
             
-            results.append({
+            subject_results.append({
                 'subject': f"S{test_sub_id}",
                 'model': 'FOMAML_adapted',
                 'calib_s': calib_s,
@@ -316,31 +382,47 @@ def main():
             })
             
             # Record generic and subject specific for this subject x calib_s combination
-            results.append({
+            subject_results.append({
                 'subject': f"S{test_sub_id}",
                 'model': 'generic_torch',
                 'calib_s': calib_s,
                 'accuracy_pct': generic_acc * 100
             })
             
-            results.append({
+            subject_results.append({
                 'subject': f"S{test_sub_id}",
                 'model': 'subject_specific_mtrf',
                 'calib_s': calib_s,
-                'accuracy_pct': SUBJECT_SPECIFIC_ACCURACIES[f"S{test_sub_id}"]
+                'accuracy_pct': baseline_accuracies.get(f"S{test_sub_id}", 50.0)
             })
 
-    # Save to CSV
-    df = pd.DataFrame(results)
-    csv_path = results_dir / "fomaml_results.csv"
-    df.to_csv(csv_path, index=False)
-    print(f"\nFOMAML results saved to {csv_path}")
+        # Save this subject's FOMAML results progressively
+        if subject_results:
+            df_sub = pd.DataFrame(subject_results)
+            header = not csv_path.exists() or csv_path.stat().st_size == 0
+            df_sub.to_csv(csv_path, mode='a', index=False, header=header)
+            print(f"Saved progressive FOMAML results for {sub_name} to {csv_path}")
+
+        # Explicit memory cleanup for this subject fold
+        if 'meta_model' in locals(): del meta_model
+        if 'generic_model' in locals(): del generic_model
+        if 'adapted_model' in locals(): del adapted_model
+        if 'subject_results' in locals(): del subject_results
+        gc.collect()
+
+    # Load complete results for plotting and analysis
+    if not csv_path.exists():
+        print("Error: No FOMAML results CSV generated.")
+        return
+        
+    df_full = pd.read_csv(csv_path)
+    print(f"\nTotal loaded rows from {csv_path}: {len(df_full)}")
 
     # Generate Learning Curve
-    generate_figures(df, figures_dir)
+    generate_figures(df_full, figures_dir, baseline_accuracies)
     print("FOMAML Learning Curve figure successfully generated!")
 
-def generate_figures(df, figures_dir):
+def generate_figures(df, figures_dir, baseline_accuracies=None):
     """Generate learning curve figure for FOMAML comparison."""
     # Compute group level summary
     summary = df.groupby(['model', 'calib_s'])['accuracy_pct'].agg(['mean', 'std']).reset_index()
