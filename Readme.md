@@ -7,7 +7,7 @@
 > **Auditory Attention Decoding (AAD) System**
 > Featuring a biologically grounded backward mTRF (Multivariate Temporal Response Function) decoder for auditory attention detection from EEG.
 
-## ⚡️ Core Architecture
+## Core Architecture
 
 This repository contains the core algorithms for a robust AAD system designed for hearing prostheses. The system relies on a backward modeling approach that reconstructs the audio envelope from multi-channel EEG data.
 
